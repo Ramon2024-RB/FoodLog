@@ -5,6 +5,70 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:sqlite3/sqlite3.dart' as sqlite;
 
+class _IngredientEntry {
+  _IngredientEntry(this.amount, this.unit, this.name);
+  final String id =
+      DateTime.now().microsecondsSinceEpoch.toString() +
+      _nextEntryId().toString();
+  String amount;
+  String unit;
+  String name;
+
+  static int _counter = 0;
+  static int _nextEntryId() => _counter++;
+
+  factory _IngredientEntry.fromText(String text) {
+    final match = RegExp(
+      r'^([0-9]+(?:[.,][0-9]+)?(?:/[0-9]+)?)\s*(g|kg|mg|ml|l|EL|TL|Stk|Stück|Prise|Prisen|Dose|Dosen|Pck|Päckchen)?\s+(.+)$',
+      caseSensitive: false,
+    ).firstMatch(text.trim());
+    if (match == null) return _IngredientEntry('', '', text);
+    return _IngredientEntry(
+      match.group(1)!,
+      match.group(2) ?? '',
+      match.group(3)!,
+    );
+  }
+
+  String get storedText => [
+    amount.trim(),
+    unit.trim(),
+    name.trim(),
+  ].where((part) => part.isNotEmpty).join(' ');
+}
+
+class _StepEntry {
+  _StepEntry(this.text);
+  final String id = '${DateTime.now().microsecondsSinceEpoch}_${_nextId()}';
+  String text;
+  static int _counter = 0;
+  static int _nextId() => _counter++;
+}
+
+String _scaledIngredient(String text, int original, int target) {
+  if (original == target || original <= 0) return text;
+  final match = RegExp(r'^([0-9]+(?:[.,][0-9]+)?|[0-9]+/[0-9]+)(.*)$')
+      .firstMatch(text.trim());
+  if (match == null) return text;
+  final raw = match.group(1)!.replaceAll(',', '.');
+  final parts = raw.split('/');
+  final amount = parts.length == 2
+      ? (double.tryParse(parts[1]) ?? 0) == 0
+            ? null
+            : (double.tryParse(parts[0]) ?? 0) / double.parse(parts[1])
+      : double.tryParse(raw);
+  if (amount == null || !amount.isFinite) return text;
+  final scaled = amount * target / original;
+  final formatted = scaled == scaled.roundToDouble()
+      ? scaled.toInt().toString()
+      : scaled
+            .toStringAsFixed(2)
+            .replaceFirst(RegExp(r'0+$'), '')
+            .replaceFirst(RegExp(r'\.$'), '')
+            .replaceAll('.', ',');
+  return '$formatted${match.group(2)}';
+}
+
 class Recipe {
   Recipe({
     required this.id,
@@ -286,11 +350,14 @@ class _RecipesPageState extends State<RecipesPage> {
   Future<void> _editRecipe([Recipe? existing]) async {
     String title = existing?.title ?? '';
     String description = existing?.description ?? '';
-    String ingredients = existing?.ingredients.join('\n') ?? '';
-    String steps = existing?.steps.join('\n') ?? '';
     String minutes = '${existing?.minutes ?? 30}';
     String servings = '${existing?.servings ?? 2}';
-
+    final ingredients = (existing?.ingredients ?? <String>[])
+        .map(_IngredientEntry.fromText)
+        .toList();
+    final steps = (existing?.steps ?? <String>[]).map(_StepEntry.new).toList();
+    if (ingredients.isEmpty) ingredients.add(_IngredientEntry('', '', ''));
+    if (steps.isEmpty) steps.add(_StepEntry(''));
     final selectedFolders = <String>{
       ...?existing?.folderIds,
       if (existing == null && activeFolderId != null) activeFolderId!,
@@ -307,19 +374,32 @@ class _RecipesPageState extends State<RecipesPage> {
           child: Padding(
             padding: EdgeInsets.fromLTRB(
               20,
+              16,
               20,
-              20,
-              MediaQuery.viewInsetsOf(context).bottom + 20,
+              MediaQuery.viewInsetsOf(context).bottom + 16,
             ),
             child: Form(
               key: formKey,
               child: ListView(
                 children: [
-                  Text(
-                    existing == null ? 'Neues Rezept' : 'Rezept bearbeiten',
-                    style: Theme.of(context).textTheme.headlineSmall,
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          existing == null
+                              ? 'Neues Rezept'
+                              : 'Rezept bearbeiten',
+                          style: Theme.of(context).textTheme.headlineSmall,
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: 'Schließen',
+                        onPressed: () => Navigator.pop(sheetContext, false),
+                        icon: const Icon(Icons.close),
+                      ),
+                    ],
                   ),
-                  const SizedBox(height: 20),
+                  const SizedBox(height: 18),
                   TextFormField(
                     initialValue: title,
                     onChanged: (value) => title = value,
@@ -354,10 +434,8 @@ class _RecipesPageState extends State<RecipesPage> {
                             border: OutlineInputBorder(),
                           ),
                           validator: (value) {
-                            final number = int.tryParse(value ?? '');
-                            return number == null || number < 0
-                                ? 'Ungültige Zeit'
-                                : null;
+                            final n = int.tryParse(value ?? '');
+                            return n == null || n < 0 ? 'Ungültige Zeit' : null;
                           },
                         ),
                       ),
@@ -372,62 +450,143 @@ class _RecipesPageState extends State<RecipesPage> {
                             border: OutlineInputBorder(),
                           ),
                           validator: (value) {
-                            final number = int.tryParse(value ?? '');
-                            return number == null || number < 1
-                                ? 'Mindestens 1'
-                                : null;
+                            final n = int.tryParse(value ?? '');
+                            return n == null || n < 1 ? 'Mindestens 1' : null;
                           },
                         ),
                       ),
                     ],
                   ),
-                  const SizedBox(height: 20),
+                  const SizedBox(height: 22),
                   Text(
                     'Zutaten',
-                    style: Theme.of(context).textTheme.titleMedium,
+                    style: Theme.of(context).textTheme.titleLarge,
                   ),
                   const SizedBox(height: 6),
-                  const Text('Eine Zutat pro Zeile, z. B. 250 g Mehl'),
-                  const SizedBox(height: 8),
-                  TextFormField(
-                    initialValue: ingredients,
-                    onChanged: (value) => ingredients = value,
-                    minLines: 4,
-                    maxLines: 8,
-                    decoration: const InputDecoration(
-                      hintText: '250 g Mehl\n2 Eier\n100 ml Milch',
-                      border: OutlineInputBorder(),
+                  const Text('Menge, Einheit und Zutat getrennt eintragen.'),
+                  const SizedBox(height: 12),
+                  ...ingredients.map(
+                    (ingredient) => Padding(
+                      key: ValueKey(ingredient.id),
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: Column(
+                        children: [
+                          Row(
+                            children: [
+                              Expanded(
+                                flex: 2,
+                                child: TextFormField(
+                                  initialValue: ingredient.amount,
+                                  onChanged: (v) => ingredient.amount = v,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Menge',
+                                    hintText: '250',
+                                    border: OutlineInputBorder(),
+                                  ),
+                                  keyboardType:
+                                      const TextInputType.numberWithOptions(
+                                        decimal: true,
+                                      ),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                flex: 2,
+                                child: TextFormField(
+                                  initialValue: ingredient.unit,
+                                  onChanged: (v) => ingredient.unit = v,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Einheit',
+                                    hintText: 'g',
+                                    border: OutlineInputBorder(),
+                                  ),
+                                ),
+                              ),
+                              IconButton(
+                                tooltip: 'Zutat entfernen',
+                                icon: const Icon(Icons.remove_circle_outline),
+                                onPressed: () => updateSheet(
+                                  () => ingredients.remove(ingredient),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          TextFormField(
+                            initialValue: ingredient.name,
+                            onChanged: (v) => ingredient.name = v,
+                            decoration: const InputDecoration(
+                              labelText: 'Zutat',
+                              hintText: 'Mehl',
+                              border: OutlineInputBorder(),
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
-                  const SizedBox(height: 20),
+                  OutlinedButton.icon(
+                    onPressed: () => updateSheet(
+                      () => ingredients.add(_IngredientEntry('', '', '')),
+                    ),
+                    icon: const Icon(Icons.add),
+                    label: const Text('Zutat hinzufügen'),
+                  ),
+                  const SizedBox(height: 22),
                   Text(
                     'Zubereitung',
-                    style: Theme.of(context).textTheme.titleMedium,
+                    style: Theme.of(context).textTheme.titleLarge,
                   ),
-                  const SizedBox(height: 6),
-                  const Text('Ein Arbeitsschritt pro Zeile'),
-                  const SizedBox(height: 8),
-                  TextFormField(
-                    initialValue: steps,
-                    onChanged: (value) => steps = value,
-                    minLines: 4,
-                    maxLines: 10,
-                    decoration: const InputDecoration(
-                      hintText: 'Backofen vorheizen\nZutaten vermischen\n30 Minuten backen',
-                      border: OutlineInputBorder(),
+                  const SizedBox(height: 12),
+                  ...steps.asMap().entries.map(
+                    (entry) => Padding(
+                      key: ValueKey(entry.value.id),
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Padding(
+                            padding: const EdgeInsets.only(top: 10, right: 10),
+                            child: CircleAvatar(
+                              radius: 15,
+                              child: Text('${entry.key + 1}'),
+                            ),
+                          ),
+                          Expanded(
+                            child: TextFormField(
+                              initialValue: entry.value.text,
+                              onChanged: (v) => entry.value.text = v,
+                              minLines: 2,
+                              maxLines: 5,
+                              decoration: const InputDecoration(
+                                labelText: 'Arbeitsschritt',
+                                border: OutlineInputBorder(),
+                              ),
+                            ),
+                          ),
+                          IconButton(
+                            tooltip: 'Schritt entfernen',
+                            onPressed: () =>
+                                updateSheet(() => steps.remove(entry.value)),
+                            icon: const Icon(Icons.remove_circle_outline),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
-                  const SizedBox(height: 20),
-                  Text(
-                    'Ordner',
-                    style: Theme.of(context).textTheme.titleMedium,
+                  OutlinedButton.icon(
+                    onPressed: () =>
+                        updateSheet(() => steps.add(_StepEntry(''))),
+                    icon: const Icon(Icons.add),
+                    label: const Text('Schritt hinzufügen'),
                   ),
+                  const SizedBox(height: 22),
+                  Text('Ordner', style: Theme.of(context).textTheme.titleLarge),
                   if (folders.isEmpty)
                     const Padding(
                       padding: EdgeInsets.symmetric(vertical: 12),
                       child: Text(
-                        'Noch keine Ordner angelegt. '
-                        'Du kannst das Rezept trotzdem speichern.',
+                        'Noch keine Ordner vorhanden. Das Rezept kann trotzdem gespeichert werden.',
                       ),
                     ),
                   ...folders.map(
@@ -454,13 +613,11 @@ class _RecipesPageState extends State<RecipesPage> {
                           title: title.trim(),
                           description: description.trim(),
                           ingredients: ingredients
-                              .split('\n')
-                              .map((e) => e.trim())
-                              .where((e) => e.isNotEmpty)
+                              .where((e) => e.name.trim().isNotEmpty)
+                              .map((e) => e.storedText)
                               .toList(),
                           steps: steps
-                              .split('\n')
-                              .map((e) => e.trim())
+                              .map((e) => e.text.trim())
                               .where((e) => e.isNotEmpty)
                               .toList(),
                           minutes: int.parse(minutes),
@@ -474,6 +631,7 @@ class _RecipesPageState extends State<RecipesPage> {
                     icon: const Icon(Icons.save_outlined),
                     label: const Text('Rezept speichern'),
                   ),
+                  const SizedBox(height: 12),
                 ],
               ),
             ),
@@ -481,7 +639,6 @@ class _RecipesPageState extends State<RecipesPage> {
         ),
       ),
     );
-
     if (!mounted) return;
     if (result == true) _refresh();
   }
@@ -529,83 +686,118 @@ class _RecipesPageState extends State<RecipesPage> {
   }
 
   void _showRecipe(Recipe recipe) {
+    int displayedServings = recipe.servings;
     showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       useSafeArea: true,
-      builder: (sheetContext) => FractionallySizedBox(
-        heightFactor: 0.9,
-        child: ListView(
-          padding: const EdgeInsets.all(20),
-          children: [
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    recipe.title,
-                    style: Theme.of(context).textTheme.headlineSmall,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (context, updateSheet) => FractionallySizedBox(
+          heightFactor: 0.9,
+          child: ListView(
+            padding: const EdgeInsets.all(20),
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      recipe.title,
+                      style: Theme.of(context).textTheme.headlineSmall,
+                    ),
                   ),
-                ),
-                IconButton(
-                  icon: const Icon(Icons.edit_outlined),
-                  onPressed: () {
-                    Navigator.pop(sheetContext);
-                    _editRecipe(recipe);
-                  },
-                ),
-                IconButton(
-                  icon: const Icon(Icons.delete_outline),
-                  onPressed: () {
-                    Navigator.pop(sheetContext);
-                    _deleteRecipe(recipe);
-                  },
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            if (recipe.description.isNotEmpty) Text(recipe.description),
-            const SizedBox(height: 12),
-            Wrap(
-              spacing: 12,
-              children: [
-                Chip(
-                  avatar: const Icon(Icons.schedule, size: 18),
-                  label: Text('${recipe.minutes} Min.'),
-                ),
-                Chip(
-                  avatar: const Icon(Icons.people_outline, size: 18),
-                  label: Text('${recipe.servings} Portionen'),
-                ),
-              ],
-            ),
-            const SizedBox(height: 20),
-            Text('Zutaten', style: Theme.of(context).textTheme.titleLarge),
-            const SizedBox(height: 8),
-            if (recipe.ingredients.isEmpty)
-              const Text('Keine Zutaten eingetragen'),
-            ...recipe.ingredients.map(
-              (ingredient) => ListTile(
-                leading: const Icon(Icons.check_circle_outline),
-                title: Text(ingredient),
-                contentPadding: EdgeInsets.zero,
+                  IconButton(
+                    tooltip: 'Bearbeiten',
+                    icon: const Icon(Icons.edit_outlined),
+                    onPressed: () {
+                      Navigator.pop(sheetContext);
+                      _editRecipe(recipe);
+                    },
+                  ),
+                  IconButton(
+                    tooltip: 'Löschen',
+                    icon: const Icon(Icons.delete_outline),
+                    onPressed: () {
+                      Navigator.pop(sheetContext);
+                      _deleteRecipe(recipe);
+                    },
+                  ),
+                ],
               ),
-            ),
-            const SizedBox(height: 20),
-            Text('Zubereitung', style: Theme.of(context).textTheme.titleLarge),
-            const SizedBox(height: 8),
-            if (recipe.steps.isEmpty)
-              const Text('Keine Zubereitungsschritte eingetragen'),
-            ...recipe.steps.asMap().entries.map(
-              (entry) => ListTile(
-                leading: CircleAvatar(
-                  radius: 15,
-                  child: Text('${entry.key + 1}'),
-                ),
-                title: Text(entry.value),
-                contentPadding: EdgeInsets.zero,
+              const SizedBox(height: 12),
+              if (recipe.description.isNotEmpty) Text(recipe.description),
+              const SizedBox(height: 12),
+              Chip(
+                avatar: const Icon(Icons.schedule, size: 18),
+                label: Text('${recipe.minutes} Min.'),
               ),
-            ),
-          ],
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  const Expanded(
+                    child: Text(
+                      'Portionen',
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Weniger Portionen',
+                    onPressed: displayedServings > 1
+                        ? () => updateSheet(() => displayedServings--)
+                        : null,
+                    icon: const Icon(Icons.remove_circle_outline),
+                  ),
+                  Text(
+                    '$displayedServings',
+                    style: Theme.of(context).textTheme.titleLarge,
+                  ),
+                  IconButton(
+                    tooltip: 'Mehr Portionen',
+                    onPressed: () => updateSheet(() => displayedServings++),
+                    icon: const Icon(Icons.add_circle_outline),
+                  ),
+                ],
+              ),
+              const Text(
+                'Die Zutatenmengen werden für die gewählte Portionszahl angepasst.',
+              ),
+              const SizedBox(height: 20),
+              Text('Zutaten', style: Theme.of(context).textTheme.titleLarge),
+              const SizedBox(height: 8),
+              if (recipe.ingredients.isEmpty)
+                const Text('Keine Zutaten eingetragen'),
+              ...recipe.ingredients.map(
+                (ingredient) => ListTile(
+                  leading: const Icon(Icons.check_circle_outline),
+                  title: Text(
+                    _scaledIngredient(
+                      ingredient,
+                      recipe.servings,
+                      displayedServings,
+                    ),
+                  ),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+              const SizedBox(height: 20),
+              Text(
+                'Zubereitung',
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
+              const SizedBox(height: 8),
+              if (recipe.steps.isEmpty)
+                const Text('Keine Zubereitungsschritte eingetragen'),
+              ...recipe.steps.asMap().entries.map(
+                (entry) => ListTile(
+                  leading: CircleAvatar(
+                    radius: 15,
+                    child: Text('${entry.key + 1}'),
+                  ),
+                  title: Text(entry.value),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
