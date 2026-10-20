@@ -1,4 +1,7 @@
 import 'dart:convert';
+import 'dart:io';
+
+import 'package:image_picker/image_picker.dart';
 
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
@@ -69,6 +72,39 @@ String _scaledIngredient(String text, int original, int target) {
   return '$formatted${match.group(2)}';
 }
 
+class RecipePhoto {
+  RecipePhoto({
+    required this.id,
+    required this.recipeId,
+    required this.path,
+    required this.stepIndex,
+    required this.position,
+  });
+  final String id;
+  final String recipeId;
+  final String path;
+  final int? stepIndex; // null = gallery; -1 = cover
+  final int position;
+}
+
+Widget _photoPreview(String path, {double height = 120}) {
+  return ClipRRect(
+    borderRadius: BorderRadius.circular(12),
+    child: Image.file(
+      File(path),
+      height: height,
+      width: double.infinity,
+      fit: BoxFit.cover,
+      errorBuilder: (context, error, stackTrace) => Container(
+        height: height,
+        color: Colors.black12,
+        alignment: Alignment.center,
+        child: const Icon(Icons.broken_image_outlined),
+      ),
+    ),
+  );
+}
+
 class Recipe {
   Recipe({
     required this.id,
@@ -131,6 +167,9 @@ class RecipeStorage {
         favorite INTEGER NOT NULL DEFAULT 0
       )
     ''');
+    _database!.execute(
+      'CREATE TABLE IF NOT EXISTS recipe_photos (id TEXT PRIMARY KEY, recipe_id TEXT NOT NULL, file_path TEXT NOT NULL, step_index INTEGER, position INTEGER NOT NULL DEFAULT 0)',
+    );
   }
 
   sqlite.Database get db {
@@ -209,7 +248,44 @@ class RecipeStorage {
     );
   }
 
+  List<RecipePhoto> getPhotos(String recipeId) {
+    return db
+        .select(
+          'SELECT * FROM recipe_photos WHERE recipe_id = ? ORDER BY position',
+          [recipeId],
+        )
+        .map(
+          (row) => RecipePhoto(
+            id: row['id'] as String,
+            recipeId: row['recipe_id'] as String,
+            path: row['file_path'] as String,
+            stepIndex: row['step_index'] as int?,
+            position: row['position'] as int,
+          ),
+        )
+        .toList();
+  }
+
+  void savePhotos(String recipeId, List<RecipePhoto> photos) {
+    db.execute('BEGIN TRANSACTION');
+    try {
+      db.execute('DELETE FROM recipe_photos WHERE recipe_id = ?', [recipeId]);
+      for (var i = 0; i < photos.length; i++) {
+        final photo = photos[i];
+        db.execute(
+          'INSERT INTO recipe_photos (id, recipe_id, file_path, step_index, position) VALUES (?, ?, ?, ?, ?)',
+          [photo.id, recipeId, photo.path, photo.stepIndex, i],
+        );
+      }
+      db.execute('COMMIT');
+    } catch (_) {
+      db.execute('ROLLBACK');
+      rethrow;
+    }
+  }
+
   void deleteRecipe(String id) {
+    db.execute('DELETE FROM recipe_photos WHERE recipe_id = ?', [id]);
     db.execute('DELETE FROM recipes WHERE id = ?', [id]);
   }
 
@@ -347,6 +423,26 @@ class _RecipesPageState extends State<RecipesPage> {
     }
   }
 
+  Future<String?> _pickAndStorePhoto() async {
+    final picked = await ImagePicker().pickImage(
+      source: ImageSource.gallery,
+      imageQuality: 82,
+      maxWidth: 1800,
+    );
+    if (picked == null) return null;
+    final directory = await getApplicationDocumentsDirectory();
+    final photosDir = Directory(p.join(directory.path, 'recipe_photos'));
+    await photosDir.create(recursive: true);
+    final extension = p.extension(picked.path).toLowerCase();
+    final safeExtension =
+        ['.jpg', '.jpeg', '.png', '.heic', '.webp'].contains(extension)
+        ? extension
+        : '.jpg';
+    final destination = p.join(photosDir.path, '${_newId()}$safeExtension');
+    await File(picked.path).copy(destination);
+    return destination;
+  }
+
   Future<void> _editRecipe([Recipe? existing]) async {
     String title = existing?.title ?? '';
     String description = existing?.description ?? '';
@@ -363,6 +459,35 @@ class _RecipesPageState extends State<RecipesPage> {
       if (existing == null && activeFolderId != null) activeFolderId!,
     };
     final formKey = GlobalKey<FormState>();
+    final recipeId = existing?.id ?? _newId();
+    final photos = existing == null
+        ? <RecipePhoto>[]
+        : storage.getPhotos(existing.id);
+    Future<void> addPhoto(int? stepIndex, StateSetter updateSheet) async {
+      try {
+        final path = await _pickAndStorePhoto();
+        if (path == null || !mounted) return;
+        updateSheet(() {
+          if (stepIndex == -1) {
+            photos.removeWhere((photo) => photo.stepIndex == -1);
+          }
+          photos.add(
+            RecipePhoto(
+              id: _newId(),
+              recipeId: recipeId,
+              path: path,
+              stepIndex: stepIndex,
+              position: photos.length,
+            ),
+          );
+        });
+      } catch (e) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Foto konnte nicht hinzugefügt werden: $e')),
+        );
+      }
+    }
 
     final result = await showModalBottomSheet<bool>(
       context: context,
@@ -459,6 +584,62 @@ class _RecipesPageState extends State<RecipesPage> {
                   ),
                   const SizedBox(height: 22),
                   Text(
+                    'Rezeptbilder',
+                    style: Theme.of(context).textTheme.titleLarge,
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Fotos sind optional und werden offline gespeichert.',
+                  ),
+                  const SizedBox(height: 12),
+                  ...photos
+                      .where((photo) => photo.stepIndex == -1)
+                      .map(
+                        (photo) => Column(
+                          children: [
+                            _photoPreview(photo.path, height: 170),
+                            TextButton.icon(
+                              onPressed: () =>
+                                  updateSheet(() => photos.remove(photo)),
+                              icon: const Icon(Icons.delete_outline),
+                              label: const Text('Titelbild entfernen'),
+                            ),
+                          ],
+                        ),
+                      ),
+                  OutlinedButton.icon(
+                    onPressed: () => addPhoto(-1, updateSheet),
+                    icon: const Icon(Icons.add_photo_alternate_outlined),
+                    label: const Text('Titelbild auswählen'),
+                  ),
+                  const SizedBox(height: 10),
+                  ...photos
+                      .where((photo) => photo.stepIndex == null)
+                      .map(
+                        (photo) => Padding(
+                          padding: const EdgeInsets.only(bottom: 8),
+                          child: Row(
+                            children: [
+                              Expanded(
+                                child: _photoPreview(photo.path, height: 95),
+                              ),
+                              IconButton(
+                                tooltip: 'Foto entfernen',
+                                onPressed: () =>
+                                    updateSheet(() => photos.remove(photo)),
+                                icon: const Icon(Icons.delete_outline),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                  OutlinedButton.icon(
+                    onPressed: () => addPhoto(null, updateSheet),
+                    icon: const Icon(Icons.add_photo_alternate_outlined),
+                    label: const Text('Weiteres Foto hinzufügen'),
+                  ),
+                  const SizedBox(height: 22),
+                  Text(
                     'Zutaten',
                     style: Theme.of(context).textTheme.titleLarge,
                   ),
@@ -542,33 +723,89 @@ class _RecipesPageState extends State<RecipesPage> {
                     (entry) => Padding(
                       key: ValueKey(entry.value.id),
                       padding: const EdgeInsets.only(bottom: 12),
-                      child: Row(
+                      child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Padding(
-                            padding: const EdgeInsets.only(top: 10, right: 10),
-                            child: CircleAvatar(
-                              radius: 15,
-                              child: Text('${entry.key + 1}'),
-                            ),
-                          ),
-                          Expanded(
-                            child: TextFormField(
-                              initialValue: entry.value.text,
-                              onChanged: (v) => entry.value.text = v,
-                              minLines: 2,
-                              maxLines: 5,
-                              decoration: const InputDecoration(
-                                labelText: 'Arbeitsschritt',
-                                border: OutlineInputBorder(),
+                          Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Padding(
+                                padding: const EdgeInsets.only(
+                                  top: 10,
+                                  right: 10,
+                                ),
+                                child: CircleAvatar(
+                                  radius: 15,
+                                  child: Text('${entry.key + 1}'),
+                                ),
                               ),
-                            ),
+                              Expanded(
+                                child: TextFormField(
+                                  initialValue: entry.value.text,
+                                  onChanged: (value) =>
+                                      entry.value.text = value,
+                                  minLines: 2,
+                                  maxLines: 5,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Arbeitsschritt',
+                                    border: OutlineInputBorder(),
+                                  ),
+                                ),
+                              ),
+                              IconButton(
+                                tooltip: 'Schritt entfernen',
+                                onPressed: () => updateSheet(() {
+                                  final removedIndex = entry.key;
+                                  steps.remove(entry.value);
+                                  photos.removeWhere(
+                                    (photo) => photo.stepIndex == removedIndex,
+                                  );
+                                  for (var i = 0; i < photos.length; i++) {
+                                    final photo = photos[i];
+                                    if (photo.stepIndex != null &&
+                                        photo.stepIndex! > removedIndex) {
+                                      photos[i] = RecipePhoto(
+                                        id: photo.id,
+                                        recipeId: photo.recipeId,
+                                        path: photo.path,
+                                        stepIndex: photo.stepIndex! - 1,
+                                        position: photo.position,
+                                      );
+                                    }
+                                  }
+                                }),
+                                icon: const Icon(Icons.remove_circle_outline),
+                              ),
+                            ],
                           ),
-                          IconButton(
-                            tooltip: 'Schritt entfernen',
-                            onPressed: () =>
-                                updateSheet(() => steps.remove(entry.value)),
-                            icon: const Icon(Icons.remove_circle_outline),
+                          ...photos
+                              .where((photo) => photo.stepIndex == entry.key)
+                              .map(
+                                (photo) => Row(
+                                  children: [
+                                    Expanded(
+                                      child: _photoPreview(
+                                        photo.path,
+                                        height: 110,
+                                      ),
+                                    ),
+                                    IconButton(
+                                      tooltip: 'Schrittfoto entfernen',
+                                      onPressed: () => updateSheet(
+                                        () => photos.remove(photo),
+                                      ),
+                                      icon: const Icon(Icons.delete_outline),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                          Align(
+                            alignment: Alignment.centerLeft,
+                            child: TextButton.icon(
+                              onPressed: () => addPhoto(entry.key, updateSheet),
+                              icon: const Icon(Icons.add_a_photo_outlined),
+                              label: const Text('Foto zu diesem Schritt'),
+                            ),
                           ),
                         ],
                       ),
@@ -609,7 +846,7 @@ class _RecipesPageState extends State<RecipesPage> {
                       if (!formKey.currentState!.validate()) return;
                       storage.saveRecipe(
                         Recipe(
-                          id: existing?.id ?? _newId(),
+                          id: recipeId,
                           title: title.trim(),
                           description: description.trim(),
                           ingredients: ingredients
@@ -626,6 +863,7 @@ class _RecipesPageState extends State<RecipesPage> {
                           favorite: existing?.favorite ?? false,
                         ),
                       );
+                      storage.savePhotos(recipeId, photos);
                       Navigator.pop(sheetContext, true);
                     },
                     icon: const Icon(Icons.save_outlined),
@@ -687,6 +925,7 @@ class _RecipesPageState extends State<RecipesPage> {
 
   void _showRecipe(Recipe recipe) {
     int displayedServings = recipe.servings;
+    final photos = storage.getPhotos(recipe.id);
     showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -724,6 +963,9 @@ class _RecipesPageState extends State<RecipesPage> {
                 ],
               ),
               const SizedBox(height: 12),
+              ...photos
+                  .where((photo) => photo.stepIndex == -1)
+                  .map((photo) => _photoPreview(photo.path, height: 230)),
               if (recipe.description.isNotEmpty) Text(recipe.description),
               const SizedBox(height: 12),
               Chip(
@@ -778,6 +1020,22 @@ class _RecipesPageState extends State<RecipesPage> {
                   contentPadding: EdgeInsets.zero,
                 ),
               ),
+              if (photos.any((photo) => photo.stepIndex == null)) ...[
+                const SizedBox(height: 16),
+                Text(
+                  'Weitere Bilder',
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
+                const SizedBox(height: 8),
+                ...photos
+                    .where((photo) => photo.stepIndex == null)
+                    .map(
+                      (photo) => Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: _photoPreview(photo.path, height: 200),
+                      ),
+                    ),
+              ],
               const SizedBox(height: 20),
               Text(
                 'Zubereitung',
@@ -787,13 +1045,29 @@ class _RecipesPageState extends State<RecipesPage> {
               if (recipe.steps.isEmpty)
                 const Text('Keine Zubereitungsschritte eingetragen'),
               ...recipe.steps.asMap().entries.map(
-                (entry) => ListTile(
-                  leading: CircleAvatar(
-                    radius: 15,
-                    child: Text('${entry.key + 1}'),
-                  ),
-                  title: Text(entry.value),
-                  contentPadding: EdgeInsets.zero,
+                (entry) => Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    ListTile(
+                      leading: CircleAvatar(
+                        radius: 15,
+                        child: Text('${entry.key + 1}'),
+                      ),
+                      title: Text(entry.value),
+                      contentPadding: EdgeInsets.zero,
+                    ),
+                    ...photos
+                        .where((photo) => photo.stepIndex == entry.key)
+                        .map(
+                          (photo) => Padding(
+                            padding: const EdgeInsets.only(
+                              left: 40,
+                              bottom: 10,
+                            ),
+                            child: _photoPreview(photo.path, height: 170),
+                          ),
+                        ),
+                  ],
                 ),
               ),
             ],
@@ -804,11 +1078,21 @@ class _RecipesPageState extends State<RecipesPage> {
   }
 
   Widget _recipeCard(Recipe recipe) {
+    final cover = storage
+        .getPhotos(recipe.id)
+        .where((photo) => photo.stepIndex == -1)
+        .firstOrNull;
     return Card(
       margin: const EdgeInsets.only(bottom: 10),
       child: ListTile(
         contentPadding: const EdgeInsets.all(12),
-        leading: const CircleAvatar(child: Icon(Icons.restaurant_menu)),
+        leading: cover == null
+            ? const CircleAvatar(child: Icon(Icons.restaurant_menu))
+            : SizedBox(
+                width: 56,
+                height: 56,
+                child: _photoPreview(cover.path, height: 56),
+              ),
         title: Text(
           recipe.title,
           style: const TextStyle(fontWeight: FontWeight.w600),
