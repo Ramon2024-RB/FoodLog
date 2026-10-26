@@ -369,6 +369,13 @@ class _RecipesPageState extends State<RecipesPage> {
   int selected = 0;
   String? activeFolderId;
 
+  // Filters only affect the visible recipe list, never the saved data.
+  final TextEditingController _searchController = TextEditingController();
+  String _searchQuery = '';
+  bool _onlyFavorites = false;
+  int? _maximumMinutes;
+  String _sortOrder = 'title';
+
   @override
   void initState() {
     super.initState();
@@ -377,6 +384,7 @@ class _RecipesPageState extends State<RecipesPage> {
 
   @override
   void dispose() {
+    _searchController.dispose();
     storage.dispose();
     super.dispose();
   }
@@ -1316,45 +1324,139 @@ class _RecipesPageState extends State<RecipesPage> {
   }
 
   Widget _recipeCard(Recipe recipe) {
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
     final cover = storage
         .getPhotos(recipe.id)
         .where((photo) => photo.stepIndex == -1)
         .firstOrNull;
+
     return Card(
-      margin: const EdgeInsets.only(bottom: 10),
-      child: ListTile(
-        contentPadding: const EdgeInsets.all(12),
-        leading: cover == null
-            ? const CircleAvatar(child: Icon(Icons.restaurant_menu))
-            : SizedBox(
-                width: 56,
-                height: 56,
-                child: _photoPreview(cover.path, height: 56),
-              ),
-        title: Text(
-          recipe.title,
-          style: const TextStyle(fontWeight: FontWeight.w600),
-        ),
-        subtitle: Text('${recipe.minutes} Min. · ${recipe.servings} Portionen'),
-        trailing: Row(
-          mainAxisSize: MainAxisSize.min,
+      margin: const EdgeInsets.only(bottom: 16),
+      clipBehavior: Clip.antiAlias,
+      elevation: 0,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(20),
+        side: BorderSide(color: colors.outlineVariant),
+      ),
+      child: InkWell(
+        onTap: () => _showRecipe(recipe),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            IconButton(
-              tooltip: 'Ordner zuweisen',
-              icon: const Icon(Icons.drive_file_move_outline),
-              onPressed: () => _manageRecipeFolders(recipe),
-            ),
-            IconButton(
-              tooltip: 'Favorit',
-              icon: Icon(
-                recipe.favorite ? Icons.favorite : Icons.favorite_border,
-                color: recipe.favorite ? Colors.red : null,
+            SizedBox(
+              height: 170,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  if (cover != null)
+                    Image.file(
+                      File(cover.path),
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, error, stackTrace) => Container(
+                        alignment: Alignment.center,
+                        color: colors.primaryContainer,
+                        child: Icon(
+                          Icons.restaurant_menu_outlined,
+                          size: 58,
+                          color: colors.onPrimaryContainer,
+                        ),
+                      ),
+                    )
+                  else
+                    Container(
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: [
+                            colors.primaryContainer,
+                            colors.tertiaryContainer,
+                          ],
+                        ),
+                      ),
+                      alignment: Alignment.center,
+                      child: Icon(
+                        Icons.restaurant_menu_outlined,
+                        size: 64,
+                        color: colors.onPrimaryContainer,
+                      ),
+                    ),
+                  Positioned(
+                    top: 10,
+                    right: 10,
+                    child: IconButton.filledTonal(
+                      tooltip: recipe.favorite
+                          ? 'Aus Favoriten entfernen'
+                          : 'Zu Favoriten hinzufügen',
+                      onPressed: () => _toggleFavorite(recipe),
+                      icon: Icon(
+                        recipe.favorite
+                            ? Icons.favorite
+                            : Icons.favorite_border,
+                      ),
+                    ),
+                  ),
+                ],
               ),
-              onPressed: () => _toggleFavorite(recipe),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 10, 14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          recipe.title,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.titleMedium?.copyWith(
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: 'Ordner zuweisen',
+                        onPressed: () => _manageRecipeFolders(recipe),
+                        icon: const Icon(Icons.drive_file_move_outline),
+                      ),
+                    ],
+                  ),
+                  if (recipe.description.trim().isNotEmpty) ...[
+                    const SizedBox(height: 2),
+                    Text(
+                      recipe.description,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: colors.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 9),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 6,
+                    children: [
+                      Chip(
+                        visualDensity: VisualDensity.compact,
+                        avatar: const Icon(Icons.schedule_outlined, size: 17),
+                        label: Text('${recipe.minutes} Min.'),
+                      ),
+                      Chip(
+                        visualDensity: VisualDensity.compact,
+                        avatar: const Icon(Icons.people_outline, size: 17),
+                        label: Text('${recipe.servings} Portionen'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
             ),
           ],
         ),
-        onTap: () => _showRecipe(recipe),
       ),
     );
   }
@@ -1442,13 +1544,54 @@ class _RecipesPageState extends State<RecipesPage> {
         .where((folder) => folder.parentId == activeFolderId)
         .toList();
 
+    final query = _searchQuery.trim().toLowerCase();
     final visibleRecipes = recipes.where((recipe) {
       if (selected == 2 && !recipe.favorite) return false;
-      if (selected == 0 && activeFolderId != null) {
-        return recipe.folderIds.contains(activeFolderId);
+      if (selected == 0 &&
+          activeFolderId != null &&
+          !recipe.folderIds.contains(activeFolderId)) {
+        return false;
+      }
+      if (_onlyFavorites && !recipe.favorite) return false;
+      if (_maximumMinutes != null && recipe.minutes > _maximumMinutes!) {
+        return false;
+      }
+      if (query.isNotEmpty) {
+        final matches =
+            recipe.title.toLowerCase().contains(query) ||
+            recipe.description.toLowerCase().contains(query) ||
+            recipe.ingredients.any(
+              (item) => item.toLowerCase().contains(query),
+            );
+        if (!matches) return false;
       }
       return true;
     }).toList();
+
+    // Sorting is performed on a new list; it never changes stored recipes.
+    switch (_sortOrder) {
+      case 'shortest':
+        visibleRecipes.sort((a, b) {
+          final difference = a.minutes.compareTo(b.minutes);
+          return difference != 0
+              ? difference
+              : a.title.toLowerCase().compareTo(b.title.toLowerCase());
+        });
+      case 'longest':
+        visibleRecipes.sort((a, b) {
+          final difference = b.minutes.compareTo(a.minutes);
+          return difference != 0
+              ? difference
+              : a.title.toLowerCase().compareTo(b.title.toLowerCase());
+        });
+      default:
+        visibleRecipes.sort(
+          (a, b) => a.title.toLowerCase().compareTo(b.title.toLowerCase()),
+        );
+    }
+
+    final hasActiveFilters =
+        query.isNotEmpty || _onlyFavorites || _maximumMinutes != null;
 
     return Scaffold(
       floatingActionButton: selected == 0
@@ -1479,6 +1622,107 @@ class _RecipesPageState extends State<RecipesPage> {
             },
           ),
           const SizedBox(height: 22),
+          if (selected != 1) ...[
+            TextField(
+              controller: _searchController,
+              textInputAction: TextInputAction.search,
+              onChanged: (value) => setState(() => _searchQuery = value),
+              decoration: InputDecoration(
+                hintText: 'Rezept oder Zutat suchen',
+                prefixIcon: const Icon(Icons.search),
+                suffixIcon: _searchQuery.isEmpty
+                    ? null
+                    : IconButton(
+                        tooltip: 'Suche löschen',
+                        onPressed: () {
+                          _searchController.clear();
+                          setState(() => _searchQuery = '');
+                        },
+                        icon: const Icon(Icons.close),
+                      ),
+                filled: true,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(16),
+                  borderSide: BorderSide.none,
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 6,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                if (selected != 2)
+                  FilterChip(
+                    label: const Text('Nur Favoriten'),
+                    avatar: const Icon(Icons.favorite_border, size: 18),
+                    selected: _onlyFavorites,
+                    onSelected: (value) =>
+                        setState(() => _onlyFavorites = value),
+                  ),
+                ChoiceChip(
+                  label: const Text('Bis 30 Min.'),
+                  selected: _maximumMinutes == 30,
+                  onSelected: (selected) =>
+                      setState(() => _maximumMinutes = selected ? 30 : null),
+                ),
+                ChoiceChip(
+                  label: const Text('Bis 60 Min.'),
+                  selected: _maximumMinutes == 60,
+                  onSelected: (selected) =>
+                      setState(() => _maximumMinutes = selected ? 60 : null),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    '${visibleRecipes.length} ${visibleRecipes.length == 1 ? 'Rezept' : 'Rezepte'} gefunden',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ),
+                const Icon(Icons.sort, size: 19),
+                const SizedBox(width: 6),
+                DropdownButton<String>(
+                  value: _sortOrder,
+                  underline: const SizedBox.shrink(),
+                  isDense: true,
+                  items: const [
+                    DropdownMenuItem(value: 'title', child: Text('A–Z')),
+                    DropdownMenuItem(
+                      value: 'shortest',
+                      child: Text('Kürzeste Zeit'),
+                    ),
+                    DropdownMenuItem(
+                      value: 'longest',
+                      child: Text('Längste Zeit'),
+                    ),
+                  ],
+                  onChanged: (value) {
+                    if (value != null) setState(() => _sortOrder = value);
+                  },
+                ),
+              ],
+            ),
+            if (hasActiveFilters)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  onPressed: () => setState(() {
+                    _searchController.clear();
+                    _searchQuery = '';
+                    _onlyFavorites = false;
+                    _maximumMinutes = null;
+                  }),
+                  icon: const Icon(Icons.filter_alt_off_outlined, size: 18),
+                  label: const Text('Filter zurücksetzen'),
+                ),
+              ),
+            const SizedBox(height: 14),
+          ],
           if (selected == 1)
             const Padding(
               padding: EdgeInsets.all(24),
@@ -1514,7 +1758,7 @@ class _RecipesPageState extends State<RecipesPage> {
                 ],
               ),
               const SizedBox(height: 10),
-              if (visibleFolders.isNotEmpty)
+              if (visibleFolders.isNotEmpty && query.isEmpty)
                 GridView.builder(
                   shrinkWrap: true,
                   physics: const NeverScrollableScrollPhysics(),
@@ -1542,6 +1786,8 @@ class _RecipesPageState extends State<RecipesPage> {
                   child: Text(
                     selected == 2
                         ? 'Noch keine Favoriten vorhanden.'
+                        : hasActiveFilters
+                        ? 'Keine Rezepte für diese Suche oder Filter gefunden.'
                         : 'Hier erscheinen deine Rezepte.',
                   ),
                 ),
