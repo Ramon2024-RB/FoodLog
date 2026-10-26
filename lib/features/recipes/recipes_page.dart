@@ -226,6 +226,62 @@ class RecipeStorage {
     );
   }
 
+  /// Moves a folder without allowing cycles in the folder tree.
+  void moveFolder(RecipeFolder folder, String? newParentId) {
+    if (newParentId == folder.id) {
+      throw StateError('Ein Ordner kann nicht in sich selbst liegen.');
+    }
+    final all = getFolders();
+    var current = newParentId;
+    final visited = <String>{};
+    while (current != null) {
+      if (current == folder.id || !visited.add(current)) {
+        throw StateError(
+          'Ein Ordner kann nicht in einen Unterordner verschoben werden.',
+        );
+      }
+      final match = all.where((f) => f.id == current).firstOrNull;
+      if (match == null) throw StateError('Zielordner nicht gefunden.');
+      current = match.parentId;
+    }
+    saveFolder(
+      RecipeFolder(id: folder.id, name: folder.name, parentId: newParentId),
+    );
+  }
+
+  /// Removes only the folder. Direct subfolders are moved one level up;
+  /// recipes, photos and all other folder assignments remain intact.
+  void deleteFolder(RecipeFolder folder) {
+    db.execute('BEGIN TRANSACTION');
+    try {
+      db.execute(
+        'UPDATE recipe_folders SET parent_id = ? WHERE parent_id = ?',
+        [folder.parentId, folder.id],
+      );
+      for (final recipe in getRecipes()) {
+        if (!recipe.folderIds.contains(folder.id)) continue;
+        saveRecipe(
+          Recipe(
+            id: recipe.id,
+            title: recipe.title,
+            description: recipe.description,
+            ingredients: recipe.ingredients,
+            steps: recipe.steps,
+            minutes: recipe.minutes,
+            servings: recipe.servings,
+            folderIds: recipe.folderIds.where((id) => id != folder.id).toList(),
+            favorite: recipe.favorite,
+          ),
+        );
+      }
+      db.execute('DELETE FROM recipe_folders WHERE id = ?', [folder.id]);
+      db.execute('COMMIT');
+    } catch (_) {
+      db.execute('ROLLBACK');
+      rethrow;
+    }
+  }
+
   void saveRecipe(Recipe recipe) {
     db.execute(
       '''
@@ -421,6 +477,188 @@ class _RecipesPageState extends State<RecipesPage> {
       );
       _refresh();
     }
+  }
+
+  Future<void> _renameFolder(RecipeFolder folder) async {
+    var name = folder.name;
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Ordner umbenennen'),
+        content: TextFormField(
+          initialValue: name,
+          autofocus: true,
+          maxLength: 60,
+          decoration: const InputDecoration(labelText: 'Ordnername'),
+          onChanged: (value) => name = value,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Abbrechen'),
+          ),
+          FilledButton(
+            onPressed: () {
+              if (name.trim().isEmpty) return;
+              Navigator.pop(dialogContext, true);
+            },
+            child: const Text('Speichern'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || accepted != true) return;
+    storage.saveFolder(
+      RecipeFolder(id: folder.id, name: name.trim(), parentId: folder.parentId),
+    );
+    _refresh();
+  }
+
+  Future<void> _moveFolder(RecipeFolder folder) async {
+    // The folder itself and all descendants are invalid destinations.
+    final excluded = <String>{folder.id};
+    var changed = true;
+    while (changed) {
+      changed = false;
+      for (final candidate in folders) {
+        if (candidate.parentId != null &&
+            excluded.contains(candidate.parentId) &&
+            excluded.add(candidate.id)) {
+          changed = true;
+        }
+      }
+    }
+    String? destination = folder.parentId;
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, updateDialog) => AlertDialog(
+          title: const Text('Ordner verschieben'),
+          content: DropdownButtonFormField<String>(
+            isExpanded: true,
+            initialValue: destination ?? '',
+            decoration: const InputDecoration(labelText: 'Zielordner'),
+            items: [
+              const DropdownMenuItem(value: '', child: Text('Hauptebene')),
+              ...folders
+                  .where((f) => !excluded.contains(f.id))
+                  .map(
+                    (f) => DropdownMenuItem(value: f.id, child: Text(f.name)),
+                  ),
+            ],
+            onChanged: (value) => updateDialog(() {
+              destination = value == null || value.isEmpty ? null : value;
+            }),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Abbrechen'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('Verschieben'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted || accepted != true) return;
+    try {
+      storage.moveFolder(folder, destination);
+      _refresh();
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Ordner konnte nicht verschoben werden: $e')),
+      );
+    }
+  }
+
+  Future<void> _deleteFolder(RecipeFolder folder) async {
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Ordner löschen?'),
+        content: Text(
+          '„${folder.name}“ wird gelöscht. Rezepte und Fotos '
+          'bleiben erhalten. Unterordner rücken eine Ebene nach oben.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Abbrechen'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Ordner löschen'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || accepted != true) return;
+    storage.deleteFolder(folder);
+    if (activeFolderId == folder.id) activeFolderId = folder.parentId;
+    _refresh();
+  }
+
+  Future<void> _manageRecipeFolders(Recipe recipe) async {
+    final chosen = recipe.folderIds.toSet();
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, updateDialog) => AlertDialog(
+          title: Text('Ordner für „${recipe.title}“'),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: folders.isEmpty
+                ? const Text('Noch keine Ordner vorhanden.')
+                : ListView(
+                    shrinkWrap: true,
+                    children: folders
+                        .map(
+                          (folder) => CheckboxListTile(
+                            title: Text(folder.name),
+                            value: chosen.contains(folder.id),
+                            onChanged: (checked) => updateDialog(() {
+                              if (checked == true) {
+                                chosen.add(folder.id);
+                              } else {
+                                chosen.remove(folder.id);
+                              }
+                            }),
+                          ),
+                        )
+                        .toList(),
+                  ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Abbrechen'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('Speichern'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted || accepted != true) return;
+    storage.saveRecipe(
+      Recipe(
+        id: recipe.id,
+        title: recipe.title,
+        description: recipe.description,
+        ingredients: recipe.ingredients,
+        steps: recipe.steps,
+        minutes: recipe.minutes,
+        servings: recipe.servings,
+        folderIds: chosen.toList(),
+        favorite: recipe.favorite,
+      ),
+    );
+    _refresh();
   }
 
   Future<String?> _pickAndStorePhoto() async {
@@ -1098,12 +1336,23 @@ class _RecipesPageState extends State<RecipesPage> {
           style: const TextStyle(fontWeight: FontWeight.w600),
         ),
         subtitle: Text('${recipe.minutes} Min. · ${recipe.servings} Portionen'),
-        trailing: IconButton(
-          icon: Icon(
-            recipe.favorite ? Icons.favorite : Icons.favorite_border,
-            color: recipe.favorite ? Colors.red : null,
-          ),
-          onPressed: () => _toggleFavorite(recipe),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            IconButton(
+              tooltip: 'Ordner zuweisen',
+              icon: const Icon(Icons.drive_file_move_outline),
+              onPressed: () => _manageRecipeFolders(recipe),
+            ),
+            IconButton(
+              tooltip: 'Favorit',
+              icon: Icon(
+                recipe.favorite ? Icons.favorite : Icons.favorite_border,
+                color: recipe.favorite ? Colors.red : null,
+              ),
+              onPressed: () => _toggleFavorite(recipe),
+            ),
+          ],
         ),
         onTap: () => _showRecipe(recipe),
       ),
@@ -1127,7 +1376,31 @@ class _RecipesPageState extends State<RecipesPage> {
             crossAxisAlignment: CrossAxisAlignment.start,
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              const Icon(Icons.folder_outlined, size: 32),
+              Row(
+                children: [
+                  const Icon(Icons.folder_outlined, size: 32),
+                  const Spacer(),
+                  PopupMenuButton<String>(
+                    tooltip: 'Ordner verwalten',
+                    icon: const Icon(Icons.more_vert),
+                    onSelected: (action) {
+                      switch (action) {
+                        case 'rename':
+                          _renameFolder(folder);
+                        case 'move':
+                          _moveFolder(folder);
+                        case 'delete':
+                          _deleteFolder(folder);
+                      }
+                    },
+                    itemBuilder: (context) => const [
+                      PopupMenuItem(value: 'rename', child: Text('Umbenennen')),
+                      PopupMenuItem(value: 'move', child: Text('Verschieben')),
+                      PopupMenuItem(value: 'delete', child: Text('Löschen')),
+                    ],
+                  ),
+                ],
+              ),
               const SizedBox(height: 10),
               Text(
                 folder.name,
@@ -1247,7 +1520,7 @@ class _RecipesPageState extends State<RecipesPage> {
                   physics: const NeverScrollableScrollPhysics(),
                   gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
                     crossAxisCount: 2,
-                    childAspectRatio: 1.45,
+                    childAspectRatio: 1.25,
                     crossAxisSpacing: 10,
                     mainAxisSpacing: 10,
                   ),
